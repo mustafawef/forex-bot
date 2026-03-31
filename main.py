@@ -2,20 +2,15 @@ import requests
 import time
 import csv
 import os
-import json
+import threading
 from datetime import datetime
 from flask import Flask
 
 # =========================
 # الإعدادات
 # =========================
-# مفتاح TwelveData
 TWELVEDATA_KEY = "867e160b02b3402e8ddf705c03544487"
-
-# توكين البوت من BotFather
 TOKEN = "8212195518:AAHqa5jb5h_el4ohPMc0pAxqRAQCc7kUeJI"
-
-# معرفات الدردشة (Chat IDs)
 CHAT_IDS = ["5652097199", "8214327595"] 
 
 LOG_FILE = "forex_brain.csv"
@@ -28,11 +23,9 @@ SYMBOLS_CONFIG = {
 }
 
 active_trades = {}
-offset = 0
-last_ping = 0  
 
 # =========================
-# إرسال تلغرام
+# دوال البوت الأساسية
 # =========================
 def send_msg(text, specific_chat=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -43,9 +36,6 @@ def send_msg(text, specific_chat=None):
         except:
             print("خطأ إرسال")
 
-# =========================
-# حفظ النتائج (Smart Learning)
-# =========================
 def save_trade(symbol, result, rsi_val):
     file_exists = os.path.isfile(LOG_FILE)
     with open(LOG_FILE, mode='a', newline='') as f:
@@ -59,9 +49,6 @@ def save_trade(symbol, result, rsi_val):
             "rsi": rsi_val
         })
 
-# =========================
-# قراءة البيانات (5 دقائق)
-# =========================
 def get_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={TWELVEDATA_KEY}"
     try:
@@ -77,9 +64,6 @@ def get_data(symbol):
     except:
         return None, [], [], []
 
-# =========================
-# RSI
-# =========================
 def rsi(data, period=14):
     if len(data) < period + 1:
         return 50
@@ -90,9 +74,6 @@ def rsi(data, period=14):
     avg_l = sum(losses) / period
     return 100 - (100 / (1 + (avg_g / (avg_l if avg_l != 0 else 1))))
 
-# =========================
-# Smart Learning
-# =========================
 def is_bad_zone(rsi_val):
     if not os.path.isfile(LOG_FILE):
         return False
@@ -109,9 +90,6 @@ def is_bad_zone(rsi_val):
     except:
         return False
 
-# =========================
-# Candle Confirmation
-# =========================
 def candle_confirmation(closes):
     if len(closes) < 3:
         return None
@@ -121,12 +99,9 @@ def candle_confirmation(closes):
         return "BEARISH"
     return None
 
-# =========================
-# Score
-# =========================
 def score_trade(rsi_val, price, ma100, fib, candle):
     score = 0
-    score += 2  # الاتجاه
+    score += 2  
     if 30 < rsi_val < 70:
         score += 2
     if abs(price - fib) / price < 0.001:
@@ -135,9 +110,6 @@ def score_trade(rsi_val, price, ma100, fib, candle):
         score += 3
     return score
 
-# =========================
-# الاستراتيجية
-# =========================
 def strategy(symbol, closes, highs, lows, volumes):
     if len(active_trades) >= 3:
         return None, None, None, None, None
@@ -154,13 +126,10 @@ def strategy(symbol, closes, highs, lows, volumes):
         return None, None, None, None, None
 
     ma100 = sum(closes[-100:]) / 100
-
     recent_high = max(highs[-50:])
     recent_low = min(lows[-50:])
     fib = recent_high - ((recent_high - recent_low) * 0.618)
-
     candle = candle_confirmation(closes)
-
     config = SYMBOLS_CONFIG[symbol]
 
     # BUY
@@ -180,68 +149,75 @@ def strategy(symbol, closes, highs, lows, volumes):
     return None, None, None, None, None
 
 # =========================
-# إضافة خادم Flask
+# خادم Flask (لخداع منصة Render)
 # =========================
-app = Flask(name)
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running!"
-
-if name == "main":
-    app.run(host='0.0.0.0', port=5000)  # يشغل التطبيق على المنفذ 5000
+    return "Bot is running online!"
 
 # =========================
-# المحرك الرئيسي
+# محرك تشغيل البوت في الخلفية
 # =========================
-print("🚀 بوت التداول بنسبة مخاطرة 3:1 يعمل الآن...")
-send_msg("✅ *تم تحديث نظام إدارة المخاطر!*\n\n- النسبة الحالية: 3 ربح مقابل 1 خسارة\n- نظام المومنتوم وفيبوناتشي: فعال")
+def run_bot():
+    print("🚀 بوت التداول بنسبة مخاطرة 3:1 يعمل الآن...")
+    send_msg("✅ *تم تحديث نظام إدارة المخاطر!*\n\n- النسبة الحالية: 3 ربح مقابل 1 خسارة\n- نظام المومنتوم وفيبوناتشي: فعال")
 
-last_check = 0
-while True:
-    try:
-        check_telegram_buttons()
-        curr = time.time()
-        if curr - last_check >= 300 or last_check == 0:
-            print(f"\n[{datetime.now().strftime('%H:%M')}] جولة فحص جديدة...")
-            for symbol in SYMBOLS_CONFIG.keys():
-                closes, highs, lows = get_data(symbol)
-                if not closes: continue
-                
-                if symbol in active_trades:
-                    t = active_trades[symbol]
-                    p = closes[-1]
-                    res = None
-                    if t['type'] == "BUY":
-                        if p >= t['tp']: res = "WIN ✅"
-                        elif p <= t['sl']: res = "LOSS ❌"
-                    else:
-                        if p <= t['tp']: res = "WIN ✅"
-                        elif p >= t['sl']: res = "LOSS ❌"
+    last_check = 0
+    while True:
+        try:
+            curr = time.time()
+            if curr - last_check >= 300 or last_check == 0:
+                print(f"\n[{datetime.now().strftime('%H:%M')}] جولة فحص جديدة...")
+                for symbol in SYMBOLS_CONFIG.keys():
                     
-                    if res:
-                        send_msg(f"🏁 *إغلاق صفقة:* {symbol}\nالنتيجة: {res}\nالسعر: {p}")
-                        file_exists = os.path.isfile(LOG_FILE)
-                        with open(LOG_FILE, mode='a', newline='') as f:
-                            writer = csv.DictWriter(f, fieldnames=["timestamp", "symbol", "result"])
-                            if not file_exists: writer.writeheader()
-                            writer.writerow({"timestamp": datetime.now(), "symbol": symbol, "result": res})
-                        del active_trades[symbol]
-                else:
-                    sig, ent, sl, tp, score = strategy(symbol, closes, highs, lows)
-                    if sig:
-                        msg = (f"🔥 *إشارة {sig} (إدارة 3:1)*\n\n"
-                               f"💱 الزوج: {symbol}\n"
-                               f"💵 دخول: {round(ent, 5)}\n"
-                               f"🛑 وقف الخسارة: {round(sl, 5)}\n"
-                               f"🎯 الهدف (3x): {round(tp, 5)}\n\n"
+                    # تم تصحيح استدعاء الدالة لتستقبل 4 قيم
+                    closes, highs, lows, volumes = get_data(symbol)
+                    if not closes: continue
+                    
+                    if symbol in active_trades:
+                        t = active_trades[symbol]
+                        p = closes[-1]
+                        res = None
+                        if t['type'] == "BUY":
+                            if p >= t['tp']: res = "WIN ✅"
+                            elif p <= t['sl']: res = "LOSS ❌"
+                        else:
+                            if p <= t['tp']: res = "WIN ✅"
+                            elif p >= t['sl']: res = "LOSS ❌"
+                        
+                        if res:
+                            send_msg(f"🏁 *إغلاق صفقة:* `{symbol}`\nالنتيجة: {res}\nالسعر: `{p}`")
+                            save_trade(symbol, res, rsi(closes))
+                            del active_trades[symbol]
+                    else:
+                        # تم تمرير المتغير volumes لتطابق الدالة
+                        sig, ent, sl, tp, score = strategy(symbol, closes, highs, lows, volumes)
+                        if sig:
+                            msg = (f"🔥 *إشارة {sig} (إدارة 3:1)*\n\n"
+                                   f"💱 الزوج: `{symbol}`\n"
+                                   f"💵 دخول: `{round(ent, 5)}`\n"
+                                   f"🛑 وقف الخسارة: `{round(sl, 5)}`\n"
+                                   f"🎯 الهدف (3x): `{round(tp, 5)}`\n\n"
+                                   f"⚖️ المخاطرة: 1% مقابل 3% ربح")
+                            send_msg(msg)
+                            active_trades[symbol] = {"type": sig, "entry": ent, "sl": sl, "tp": tp}
+                last_check = curr
+            time.sleep(2)
+        except Exception as e:
+            print(f"⚠️ خطأ: {e}")
+            time.sleep(10)
 
-                               f"⚖️ المخاطرة: 1% مقابل 3% ربح")
-                        send_msg(msg)
-                        active_trades[symbol] = {"type": sig, "entry": ent, "sl": sl, "tp": tp}
-                time.sleep(1)
-            last_check = curr
-        time.sleep(2)
-    except Exception as e:
-        print(f"⚠️ خطأ: {e}")
-        time.sleep(10)
+# =========================
+# التشغيل النهائي (الويب + البوت)
+# =========================
+if __name__ == "__main__":
+    # تشغيل البوت في مسار منفصل
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+
+    # تشغيل سيرفر فلاسك على البورت الذي تحدده منصة Render
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
+        
