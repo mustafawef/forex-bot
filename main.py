@@ -1,18 +1,20 @@
 import requests
 import time
+import csv
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone # تم إضافة timezone و timedelta للتوقيت
 from flask import Flask
 
 # =========================
-# الإعدادات الأساسية
+# الإعدادات
 # =========================
 TWELVEDATA_KEY = "867e160b02b3402e8ddf705c03544487"
 TOKEN = "8212195518:AAHqa5jb5h_el4ohPMc0pAxqRAQCc7kUeJI"
 CHAT_IDS = ["5652097199", "8214327595"] 
 
-# إعدادات العملات وإدارة المخاطر (3 ربح مقابل 1 خسارة)
+LOG_FILE = "forex_brain.csv"
+
 SYMBOLS_CONFIG = {
     "EUR/USD": {"sl_percent": 0.0003, "tp_percent": 0.0009},
     "GBP/USD": {"sl_percent": 0.0003, "tp_percent": 0.0009},
@@ -23,131 +25,209 @@ SYMBOLS_CONFIG = {
 active_trades = {}
 
 # =========================
-# الدوال المساعدة
+# دوال البوت الأساسية
 # =========================
-def send_msg(text):
+def send_msg(text, specific_chat=None):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    for cid in CHAT_IDS:
-        try: 
+    chats = [specific_chat] if specific_chat else CHAT_IDS
+    for cid in chats:
+        try:
             requests.post(url, data={"chat_id": cid, "text": text, "parse_mode": "Markdown"})
-        except: 
-            print("❌ خطأ في إرسال رسالة تليجرام", flush=True)
+        except:
+            print("خطأ إرسال")
+
+def save_trade(symbol, result, rsi_val):
+    file_exists = os.path.isfile(LOG_FILE)
+    with open(LOG_FILE, mode='a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "symbol", "result", "rsi"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({
+            "timestamp": datetime.now(),
+            "symbol": symbol,
+            "result": result,
+            "rsi": rsi_val
+        })
 
 def get_data(symbol):
     url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&outputsize=100&apikey={TWELVEDATA_KEY}"
     try:
         res = requests.get(url).json()
-        if "values" not in res: return None, [], [], []
+        if "values" not in res:
+            return None, [], [], []
         data = res["values"]
         closes = [float(d["close"]) for d in data][::-1]
         highs = [float(d["high"]) for d in data][::-1]
         lows = [float(d["low"]) for d in data][::-1]
-        return closes, highs, lows
-    except: 
+        volumes = [float(d["volume"]) for d in data][::-1]
+        return closes, highs, lows, volumes
+    except:
         return None, [], [], []
 
 def rsi(data, period=14):
-    if len(data) < period + 1: return 50
+    if len(data) < period + 1:
+        return 50
     deltas = [data[i] - data[i-1] for i in range(1, len(data))]
     gains = [d if d > 0 else 0 for d in deltas[-period:]]
     losses = [abs(d) if d < 0 else 0 for d in deltas[-period:]]
     avg_g = sum(gains) / period
     avg_l = sum(losses) / period
-    if avg_l == 0: return 100
-    rs = avg_g / avg_l
-    return 100 - (100 / (1 + rs))
+    return 100 - (100 / (1 + (avg_g / (avg_l if avg_l != 0 else 1))))
 
-def strategy(symbol, closes, highs, lows):
-    price, rsi_val = closes[-1], rsi(closes)
+def is_bad_zone(rsi_val):
+    if not os.path.isfile(LOG_FILE):
+        return False
+    try:
+        with open(LOG_FILE, mode='r') as f:
+            reader = csv.DictReader(f)
+            losses = 0
+            for row in reader:
+                if "LOSS" in row['result']:
+                    old_rsi = float(row.get('rsi', 50))
+                    if abs(old_rsi - rsi_val) < 3:
+                        losses += 1
+            return losses >= 3
+    except:
+        return False
+
+def candle_confirmation(closes):
+    if len(closes) < 3:
+        return None
+    if closes[-1] > closes[-2]:
+        return "BULLISH"
+    elif closes[-1] < closes[-2]:
+        return "BEARISH"
+    return None
+
+def score_trade(rsi_val, price, ma100, fib, candle):
+    score = 0
+    score += 2  
+    if 30 < rsi_val < 70:
+        score += 2
+    if abs(price - fib) / price < 0.001:
+        score += 3
+    if candle:
+        score += 3
+    return score
+
+def strategy(symbol, closes, highs, lows, volumes):
+    if len(active_trades) >= 3:
+        return None, None, None, None, None
+
+    price = closes[-1]
+    rsi_val = rsi(closes)
+
+    if is_bad_zone(rsi_val):
+        print(f"⚠️ تم تجنب صفقة بسبب الذاكرة RSI={rsi_val}")
+        return None, None, None, None, None
+
+    momentum = closes[-1] - closes[-5]
+    if abs(momentum) < 0.0002:
+        return None, None, None, None, None
+
     ma100 = sum(closes[-100:]) / 100
-    recent_high, recent_low = max(highs[-50:]), min(lows[-50:])
-    fib_618 = recent_high - ((recent_high - recent_low) * 0.618)
+    recent_high = max(highs[-50:])
+    recent_low = min(lows[-50:])
+    fib = recent_high - ((recent_high - recent_low) * 0.618)
+    candle = candle_confirmation(closes)
     config = SYMBOLS_CONFIG[symbol]
 
-    # شروط الشراء (BUY)
-    if price > ma100 and price <= fib_618 * 1.0005 and rsi_val < 45:
-        return "BUY", price, price * (1 - config['sl_percent']), price * (1 + config['tp_percent'])
-    
-    # شروط البيع (SELL)
-    if price < ma100 and price >= fib_618 * 0.9995 and rsi_val > 55:
-        return "SELL", price, price * (1 + config['sl_percent']), price * (1 - config['tp_percent'])
-    
-    return None, None, None, None
+    # BUY
+    if price > ma100 and price <= fib * 1.0005 and rsi_val < 45 and candle == "BULLISH":
+        sl = price * (1 - config['sl_percent'])
+        tp = price * (1 + config['tp_percent'])
+        score = score_trade(rsi_val, price, ma100, fib, candle)
+        return "BUY", price, sl, tp, score
+
+    # SELL
+    if price < ma100 and price >= fib * 0.9995 and rsi_val > 55 and candle == "BEARISH":
+        sl = price * (1 + config['sl_percent'])
+        tp = price * (1 - config['tp_percent'])
+        score = score_trade(rsi_val, price, ma100, fib, candle)
+        return "SELL", price, sl, tp, score
+
+    return None, None, None, None, None
 
 # =========================
-# المحرك الأساسي (Logic)
+# خادم Flask (لخداع منصة Render)
+# =========================
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running online!"
+
+# =========================
+# محرك تشغيل البوت في الخلفية
 # =========================
 def run_bot():
-    print("🚀 تم تشغيل المحرك بنظام توقيت سوريا (10ص - 9م)...", flush=True)
-    send_msg("✅ *تم تحديث نظام إدارة المخاطر!*\n\n- النسبة الحالية: 3 ربح مقابل 1 خسارة\n- نظام المومنتوم وفيبوناتشي: فعال\n- رسائل التأكيد (كل 5 دقائق): مفعلة")
+    print("🚀 بوت التداول بنسبة مخاطرة 3:1 يعمل الآن (10ص - 9م)...", flush=True)
+    send_msg("✅ *تم تفعيل النظام الجديد!*\n\n- وقت العمل: 10:00 ص إلى 09:00 م (بتوقيت سوريا).\n- رسائل التأكيد: مفعلة كل 5 دقائق.\n- الاستراتيجية: المومنتوم، فيبوناتشي، وذاكرة الخسارة.")
 
     last_check = 0
     while True:
         try:
-            # توقيت سوريا الحالي (GMT+3)
+            # حساب وقت سوريا الحالي
             syria_now = datetime.now(timezone(timedelta(hours=3)))
             current_hour = syria_now.hour
             
-            # العمل فقط من الساعة 10 صباحاً حتى 9 مساءً
+            # شرط وقت العمل (من 10 صباحاً إلى قبل 9 مساءً)
             if 10 <= current_hour < 21:
-                curr_ts = time.time()
-                
-                # تنفيذ الفحص كل 5 دقائق (300 ثانية)
-                if curr_ts - last_check >= 300 or last_check == 0:
-                    # إرسال رسالة التأكيد التي طلبتها
-                    send_msg(f"📡 *البوت يفحص السوق الآن (5M)...*\n⏰ توقيت سوريا: {syria_now.strftime('%H:%M')}")
-                    print(f"🔍 [{syria_now.strftime('%H:%M')}] جولة فحص جارية...", flush=True)
+                curr = time.time()
+                if curr - last_check >= 300 or last_check == 0:
+                    # رسالة التأكيد الدورية
+                    send_msg(f"📡 *البوت يفحص السوق الآن...*\n⏰ توقيت سوريا: {syria_now.strftime('%H:%M')}")
+                    print(f"\n[{syria_now.strftime('%H:%M')}] جولة فحص جديدة...", flush=True)
                     
                     for symbol in SYMBOLS_CONFIG.keys():
-                        closes, highs, lows = get_data(symbol)
+                        closes, highs, lows, volumes = get_data(symbol)
                         if not closes: continue
                         
-                        # إدارة الصفقات المفتوحة
                         if symbol in active_trades:
-                            trade = active_trades[symbol]
-                            current_p = closes[-1]
-                            result = None
-                            
-                            if trade['type'] == "BUY":
-                                if current_p >= trade['tp']: result = "WIN ✅"
-                                elif current_p <= trade['sl']: result = "LOSS ❌"
+                            t = active_trades[symbol]
+                            p = closes[-1]
+                            res = None
+                            if t['type'] == "BUY":
+                                if p >= t['tp']: res = "WIN ✅"
+                                elif p <= t['sl']: res = "LOSS ❌"
                             else:
-                                if current_p <= trade['tp']: result = "WIN ✅"
-                                elif current_p >= trade['sl']: result = "LOSS ❌"
+                                if p <= t['tp']: res = "WIN ✅"
+                                elif p >= t['sl']: res = "LOSS ❌"
                             
-                            if result:
-                                send_msg(f"🏁 *إغلاق صفقة:* `{symbol}`\nالنتيجة: {result}")
+                            if res:
+                                send_msg(f"🏁 *إغلاق صفقة:* `{symbol}`\nالنتيجة: {res}\nالسعر: `{p}`")
+                                save_trade(symbol, res, rsi(closes))
                                 del active_trades[symbol]
-                        
-                        # البحث عن فرص جديدة
                         else:
-                            sig, ent, sl, tp = strategy(symbol, closes, highs, lows)
+                            sig, ent, sl, tp, score = strategy(symbol, closes, highs, lows, volumes)
                             if sig:
-                                send_msg(f"🔥 *إشارة {sig} جديدة*\nالزوج: `{symbol}`\nدخول: `{round(ent, 5)}`\nالهدف: `{round(tp, 5)}` (3:1)")
-                                active_trades[symbol] = {"type": sig, "tp": tp, "sl": sl}
-                    
-                    last_check = curr_ts
+                                msg = (f"🔥 *إشارة {sig} (إدارة 3:1)*\n\n"
+                                       f"💱 الزوج: `{symbol}`\n"
+                                       f"💵 دخول: `{round(ent, 5)}`\n"
+                                       f"🛑 وقف الخسارة: `{round(sl, 5)}`\n"
+                                       f"🎯 الهدف (3x): `{round(tp, 5)}`\n"
+                                       f"⭐ التقييم: `{score}/10`\n"
+                                       f"⚖️ المخاطرة: 1% مقابل 3% ربح")
+                                send_msg(msg)
+                                active_trades[symbol] = {"type": sig, "entry": ent, "sl": sl, "tp": tp}
+                    last_check = curr
             else:
-                # خارج ساعات العمل: البوت صامت في تليجرام، ويكتب في الـ Logs فقط كل ساعة
+                # وضع الاستراحة خارج الساعات المحددة
                 if syria_now.minute == 0 and syria_now.second < 40:
                     print(f"😴 وضع الاستراحة (توقيت سوريا: {syria_now.strftime('%H:%M')})", flush=True)
             
-            time.sleep(30) # التحقق من الوقت كل 30 ثانية
-            
+            time.sleep(30) # فحص الوقت كل 30 ثانية
         except Exception as e:
-            print(f"⚠️ خطأ مفاجئ: {e}", flush=True)
+            print(f"⚠️ خطأ: {e}", flush=True)
             time.sleep(10)
 
 # =========================
-# تشغيل سيرفر الويب (Render)
+# التشغيل النهائي (الويب + البوت)
 # =========================
-app = Flask(__name__)
-@app.route('/')
-def home(): return "Bot is Active and Running"
-
 if __name__ == "__main__":
-    # تشغيل البوت في خيط منفصل
-    threading.Thread(target=run_bot).start()
-    # تشغيل Flask لتجنب إيقاف السيرفر من Render
-    port = int(os.environ.get("PORT", 10000))
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+        
